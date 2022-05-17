@@ -23,6 +23,7 @@ const (
 type Incept struct {
 	shutdownGraceTime time.Duration
 
+	pid              int
 	argv0            string
 	workingDir       string
 	binaryBackupPath string
@@ -71,11 +72,12 @@ func New(options ...func(*Incept)) (*Incept, error) {
 		if err != nil {
 			return nil, err
 		}
-		pid := p.Pid
+		i.pid = p.Pid
 
 		for {
 
 			// Process incoming signal
+			// TODO: Make OS specific and handle in extra method
 			s := (<-signalChild)
 			switch s {
 
@@ -83,7 +85,7 @@ func New(options ...func(*Incept)) (*Incept, error) {
 			// child return value and exit
 			case syscall.SIGCHLD:
 				var ws syscall.WaitStatus
-				if _, err := syscall.Wait4(pid, &ws, syscall.WNOHANG, nil); err != nil {
+				if _, err := syscall.Wait4(i.pid, &ws, syscall.WNOHANG, nil); err != nil {
 					return nil, err
 				}
 
@@ -97,12 +99,12 @@ func New(options ...func(*Incept)) (*Incept, error) {
 				if err != nil {
 					return nil, err
 				}
-				if err := shutdownPID(pid, i.shutdownGraceTime); err != nil {
+				if err := shutdownPID(i.pid, i.shutdownGraceTime); err != nil {
 					return nil, err
 				}
 				<-signalChild
 				var ws syscall.WaitStatus
-				if _, err := syscall.Wait4(pid, &ws, 0, nil); err != nil {
+				if _, err := syscall.Wait4(i.pid, &ws, 0, nil); err != nil {
 					return nil, err
 				}
 
@@ -110,7 +112,7 @@ func New(options ...func(*Incept)) (*Incept, error) {
 				if err := os.RemoveAll(i.binaryBackupPath); err != nil {
 					return nil, err
 				}
-				pid = p.Pid
+				i.pid = p.Pid
 			}
 		}
 	}
