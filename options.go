@@ -8,3 +8,11 @@ func WithShutdownGraceTime(shutdownGraceTime time.Duration) func(*Incept) {
 		i.shutdownGraceTime = shutdownGraceTime
 	}
 }
+
+// WithExitFn sets a custom function to execute once all children and the master
+// process is done
+func WithExitFn(exitFn func(code int)) func(*Incept) {
+	return func(i *Incept) {
+		i.exitFn = exitFn
+	}
+}

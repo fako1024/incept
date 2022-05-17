@@ -26,6 +26,8 @@ type Incept struct {
 	argv0            string
 	workingDir       string
 	binaryBackupPath string
+
+	exitFn func(code int)
 }
 
 // New instanciates a nnew Incept instance (should be called as soon as possible)
@@ -41,20 +43,24 @@ func New(options ...func(*Incept)) (*Incept, error) {
 	}
 
 	// Initialize a new incept instance with default parameters
-	incept := &Incept{
+	i := &Incept{
 		shutdownGraceTime: defaultShutdownGraceTime,
 		argv0:             argv0,
 		workingDir:        wd,
 		binaryBackupPath:  filepath.Join(wd, filepath.Dir(argv0), binaryBackupFilename),
+
+		exitFn: func(code int) {
+			os.Exit(code)
+		},
 	}
 
 	// Execute functional options, if any
 	for _, opt := range options {
-		opt(incept)
+		opt(i)
 	}
 
 	// Fork a child process if this is the parent and wait forever, otherwise continue
-	if os.Getenv(envChildMarker) == "" {
+	if !i.IsChild() {
 
 		signalChild := make(chan os.Signal, 1)
 		defer close(signalChild)
@@ -80,7 +86,9 @@ func New(options ...func(*Incept)) (*Incept, error) {
 				if _, err := syscall.Wait4(pid, &ws, syscall.WNOHANG, nil); err != nil {
 					return nil, err
 				}
-				os.Exit(ws.ExitStatus())
+
+				i.exitFn(ws.ExitStatus())
+				return i, err
 
 			// If SIGUSR2 was received, the child indicates that it wants to be restarted
 			// Fork a new child and terminate the old one
@@ -89,7 +97,7 @@ func New(options ...func(*Incept)) (*Incept, error) {
 				if err != nil {
 					return nil, err
 				}
-				if err := shutdownPID(pid, incept.shutdownGraceTime); err != nil {
+				if err := shutdownPID(pid, i.shutdownGraceTime); err != nil {
 					return nil, err
 				}
 				<-signalChild
@@ -99,7 +107,7 @@ func New(options ...func(*Incept)) (*Incept, error) {
 				}
 
 				// Remove the old binary
-				if err := os.RemoveAll(incept.binaryBackupPath); err != nil {
+				if err := os.RemoveAll(i.binaryBackupPath); err != nil {
 					return nil, err
 				}
 				pid = p.Pid
@@ -107,7 +115,12 @@ func New(options ...func(*Incept)) (*Incept, error) {
 		}
 	}
 
-	return incept, nil
+	return i, nil
+}
+
+// IsChild returns if this is a child process
+func (i *Incept) IsChild() bool {
+	return os.Getenv(envChildMarker) != ""
 }
 
 // Update performs the update, provided a new binary to load and an optional list
