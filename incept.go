@@ -7,6 +7,7 @@ import (
 	"io/ioutil"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"syscall"
 	"time"
@@ -22,15 +23,16 @@ const (
 type Incept struct {
 	shutdownGraceTime time.Duration
 
-	argv0      string
-	workingDir string
+	argv0            string
+	workingDir       string
+	binaryBackupPath string
 }
 
 // New instanciates a nnew Incept instance (should be called as soon as possible)
 // When called from the parent / main process, it will simply fork a subprocess and wait forever
 // When called in the child process, it will continue and serve as the replacable process for
 // any updates in the future
-func New() (*Incept, error) {
+func New(options ...func(*Incept)) (*Incept, error) {
 
 	// Determine binary path and working directory
 	argv0, wd, err := getBinaryPaths()
@@ -38,44 +40,89 @@ func New() (*Incept, error) {
 		return nil, err
 	}
 
-	// Fork a child process if this is the parent and wait forever, otherwise continue
-	if os.Getenv(envChildMarker) == "" {
-		if err := fork(); err != nil {
-			return nil, err
-		}
-
-		// Ensure that forked children do not end up zombie after being terminated
-		ignoreSIGCHLD()
-
-		// Wait forever
-		select {}
-	}
-
-	return &Incept{
+	// Initialize a new incept instance with default parameters
+	incept := &Incept{
 		shutdownGraceTime: defaultShutdownGraceTime,
 		argv0:             argv0,
 		workingDir:        wd,
-	}, nil
-}
+		binaryBackupPath:  filepath.Join(wd, filepath.Dir(argv0), binaryBackupFilename),
+	}
 
-// ShutdownGraceTime sets a custom grace time for the shutdown procedure
-func (i *Incept) ShutdownGraceTime(shutdownGraceTime time.Duration) *Incept {
-	i.shutdownGraceTime = shutdownGraceTime
-	return i
+	// Execute functional options, if any
+	for _, opt := range options {
+		opt(incept)
+	}
+
+	// Fork a child process if this is the parent and wait forever, otherwise continue
+	if os.Getenv(envChildMarker) == "" {
+
+		signalChild := make(chan os.Signal, 1)
+		defer close(signalChild)
+		signal.Notify(signalChild, syscall.SIGUSR2, syscall.SIGCHLD)
+		defer signal.Stop(signalChild)
+
+		p, err := fork()
+		if err != nil {
+			return nil, err
+		}
+		pid := p.Pid
+
+		for {
+
+			// Process incoming signal
+			s := (<-signalChild)
+			switch s {
+
+			// If SIGCHLD was received, the child terminated (or was terminated). Propagate
+			// child return value and exit
+			case syscall.SIGCHLD:
+				var ws syscall.WaitStatus
+				if _, err := syscall.Wait4(pid, &ws, syscall.WNOHANG, nil); err != nil {
+					return nil, err
+				}
+				os.Exit(ws.ExitStatus())
+
+			// If SIGUSR2 was received, the child indicates that it wants to be restarted
+			// Fork a new child and terminate the old one
+			case syscall.SIGUSR2:
+				p, err = fork()
+				if err != nil {
+					return nil, err
+				}
+				if err := shutdownPID(pid, incept.shutdownGraceTime); err != nil {
+					return nil, err
+				}
+				<-signalChild
+				var ws syscall.WaitStatus
+				if _, err := syscall.Wait4(pid, &ws, 0, nil); err != nil {
+					return nil, err
+				}
+
+				// Remove the old binary
+				if err := os.RemoveAll(incept.binaryBackupPath); err != nil {
+					return nil, err
+				}
+				pid = p.Pid
+			}
+		}
+	}
+
+	return incept, nil
 }
 
 // Update performs the update, provided a new binary to load and an optional list
 // of functions to execute prior to the replacement (e.g. server web server shutdown)
 func (i *Incept) Update(binary []byte, shutdownFn ...func() error) error {
 
+	// Perform a stat() call to extract the file permissions of the current
+	// binary for transfer to the new one
 	stat, err := os.Stat(i.argv0)
 	if err != nil {
 		return err
 	}
 
 	// Rename the currently running binary to a temporary file
-	binaryBackupPath := filepath.Join(i.workingDir, filepath.Dir(i.argv0), binaryBackupFilename)
-	if err := os.Rename(i.argv0, binaryBackupPath); err != nil {
+	if err := os.Rename(i.argv0, i.binaryBackupPath); err != nil {
 		return err
 	}
 
@@ -89,7 +136,9 @@ func (i *Incept) Update(binary []byte, shutdownFn ...func() error) error {
 	// the binary in case there is a webserver (otherwise the in-line execution here would Kill
 	// any existing connection)
 	defer func() {
-		go i.update(binaryBackupPath, shutdownFn...)
+		// TODO: This is probably still racy and only works because the return -> potential server handler
+		// is much faster than the execution of the shutdownFns. Maybe there's better ways
+		go i.update(i.binaryBackupPath, shutdownFn...)
 	}()
 
 	return nil
@@ -106,23 +155,8 @@ func (i *Incept) update(binaryBackupPath string, shutdownFn ...func() error) err
 		}
 	}
 
-	// Fork a new process based on the (now replaced) binary
-	if _, err := os.StartProcess(i.argv0, os.Args, &os.ProcAttr{
-		Dir:   i.workingDir,
-		Env:   os.Environ(),
-		Files: getFDs(),
-		Sys:   &syscall.SysProcAttr{},
-	}); err != nil {
-		return err
-	}
-
-	// Remove the old binary
-	if err := os.Remove(binaryBackupPath); err != nil {
-		return err
-	}
-
-	// (Self-)Terminate the running child / process
-	return shutdown(i.shutdownGraceTime)
+	// Indicate to the parent / master process that the child is ready to be replaced
+	return syscall.Kill(os.Getppid(), syscall.SIGUSR2)
 }
 
 func verifyChecksum(data []byte, expectedChecksum []byte) error {

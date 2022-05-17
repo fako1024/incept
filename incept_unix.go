@@ -3,40 +3,39 @@ package incept
 import (
 	"fmt"
 	"os"
-	"os/signal"
 	"syscall"
 	"time"
 )
 
-func ignoreSIGCHLD() {
-	signal.Ignore(syscall.SIGCHLD)
+func shutdownPID(pid int, grace time.Duration) error {
+
+	// TODO: Actually implement a proper grace time / KILL mechanism
+	// defer func() {
+	// 	time.Sleep(grace)
+	// 	syscall.Kill(pid, syscall.SIGKILL)
+	// }()
+
+	return syscall.Kill(pid, syscall.SIGTERM)
 }
 
-func shutdown(grace time.Duration) error {
-	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
-		return err
-	}
-	time.Sleep(grace)
-	return syscall.Kill(os.Getpid(), syscall.SIGKILL)
-}
-
-func fork() error {
+func fork() (*os.Process, error) {
 	argv0, wd, err := getBinaryPaths()
 	if nil != err {
-		return err
+		return nil, err
 	}
 
 	env := append(os.Environ(), fmt.Sprintf("%s=TRUE", envChildMarker))
-	if _, err = os.StartProcess(argv0, os.Args, &os.ProcAttr{
+	p, err := os.StartProcess(argv0, os.Args, &os.ProcAttr{
 		Dir:   wd,
 		Env:   env,
 		Files: getFDs(),
-		Sys:   &syscall.SysProcAttr{},
-	}); err != nil {
-		return err
+		Sys:   &syscall.SysProcAttr{Pdeathsig: syscall.SIGTERM},
+	})
+	if err != nil {
+		return nil, err
 	}
 
-	return nil
+	return p, nil
 }
 
 func getFDs() []*os.File {
