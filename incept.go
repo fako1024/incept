@@ -51,7 +51,7 @@ func New(options ...func(*Incept)) (*Incept, error) {
 		shutdownGraceTime: defaultShutdownGraceTime,
 		argv0:             argv0,
 		workingDir:        wd,
-		binaryBackupPath:  filepath.Join(wd, filepath.Dir(argv0), binaryBackupFilename),
+		binaryBackupPath:  filepath.Join(filepath.Dir(argv0), binaryBackupFilename),
 
 		exitFn: func(code int) {
 			os.Exit(code)
@@ -65,59 +65,7 @@ func New(options ...func(*Incept)) (*Incept, error) {
 
 	// Fork a child process if this is the parent and wait forever, otherwise continue
 	if !i.IsChild() {
-
-		signalChild := make(chan os.Signal, 1)
-		defer close(signalChild)
-		signal.Notify(signalChild, syscall.SIGUSR2, syscall.SIGCHLD)
-		defer signal.Stop(signalChild)
-
-		p, err := fork()
-		if err != nil {
-			return nil, err
-		}
-		i.pid = p.Pid
-
-		for {
-
-			// Process incoming signal
-			// TODO: Make OS specific and handle in extra method
-			s := (<-signalChild)
-			switch s {
-
-			// If SIGCHLD was received, the child terminated (or was terminated). Propagate
-			// child return value and exit
-			case syscall.SIGCHLD:
-				var ws syscall.WaitStatus
-				if _, err := syscall.Wait4(i.pid, &ws, syscall.WNOHANG, nil); err != nil {
-					return nil, err
-				}
-
-				i.exitFn(ws.ExitStatus())
-				return i, err
-
-			// If SIGUSR2 was received, the child indicates that it wants to be restarted
-			// Fork a new child and terminate the old one
-			case syscall.SIGUSR2:
-				p, err = fork()
-				if err != nil {
-					return nil, err
-				}
-				if err := shutdownPID(i.pid, i.shutdownGraceTime); err != nil {
-					return nil, err
-				}
-				<-signalChild
-				var ws syscall.WaitStatus
-				if _, err := syscall.Wait4(i.pid, &ws, 0, nil); err != nil {
-					return nil, err
-				}
-
-				// Remove the old binary
-				if err := os.RemoveAll(i.binaryBackupPath); err != nil {
-					return nil, err
-				}
-				i.pid = p.Pid
-			}
-		}
+		return i.handleSignal()
 	}
 
 	return i, nil
@@ -141,6 +89,7 @@ func (i *Incept) Update(binary []byte, shutdownFn ...func() error) error {
 
 	// Rename the currently running binary to a temporary file
 	if err := os.Rename(i.argv0, i.binaryBackupPath); err != nil {
+		fmt.Println("Got rename error:", err)
 		return err
 	}
 
@@ -162,20 +111,83 @@ func (i *Incept) Update(binary []byte, shutdownFn ...func() error) error {
 	return nil
 }
 
-/////////////////////////////////////////////////////////////
-
-func shutdownPID(pid int, grace time.Duration) error {
-
-	// TODO: Actually implement a proper grace time / KILL mechanism
-	// defer func() {
-	// 	time.Sleep(grace)
-	// 	syscall.Kill(pid, syscall.SIGKILL)
-	// }()
-
-	return syscall.Kill(pid, syscall.SIGTERM)
+// Binary returns the currently running binary
+func (i *Incept) Binary() ([]byte, error) {
+	return ioutil.ReadFile(i.argv0)
 }
 
-func fork() (*os.Process, error) {
+/////////////////////////////////////////////////////////////
+
+func (i *Incept) handleSignal() (*Incept, error) {
+
+	signalChild := make(chan os.Signal, 1)
+	defer close(signalChild)
+	signal.Notify(signalChild, syscall.SIGUSR2, syscall.SIGCHLD)
+	defer signal.Stop(signalChild)
+
+	p, err := i.fork()
+	if err != nil {
+		return nil, err
+	}
+	i.pid = p.Pid
+
+	for {
+
+		// Process incoming signal
+		// TODO: Make OS specific and handle in extra method
+		s := (<-signalChild)
+		switch s {
+
+		// If SIGCHLD was received, the child terminated (or was terminated). Propagate
+		// child return value and exit
+		case syscall.SIGCHLD:
+			var ws syscall.WaitStatus
+			if _, err := syscall.Wait4(i.pid, &ws, syscall.WNOHANG, nil); err != nil {
+				return nil, err
+			}
+
+			i.exitFn(ws.ExitStatus())
+			return i, err
+
+		// If SIGUSR2 was received, the child indicates that it wants to be restarted
+		// Fork a new child and terminate the old one
+		case syscall.SIGUSR2:
+			p, err = i.fork()
+			if err != nil {
+				return nil, err
+			}
+			if err := shutdownPID(i.pid, i.shutdownGraceTime); err != nil {
+				return nil, err
+			}
+			<-signalChild
+			var ws syscall.WaitStatus
+			if _, err := syscall.Wait4(i.pid, &ws, 0, nil); err != nil {
+				return nil, err
+			}
+
+			// Remove the old binary
+			if err := os.RemoveAll(i.binaryBackupPath); err != nil {
+				return nil, err
+			}
+			i.pid = p.Pid
+		}
+	}
+}
+
+func (i *Incept) update(binaryBackupPath string, shutdownFn ...func() error) error {
+
+	// Execute shutdown handlers, if any
+	for _, fn := range shutdownFn {
+		if err := fn(); err != nil {
+			return err
+		}
+	}
+
+	// Indicate to the parent / master process that the child is ready to be replaced
+	return syscall.Kill(os.Getppid(), syscall.SIGUSR2)
+}
+
+func (i *Incept) fork() (*os.Process, error) {
 	argv0, wd, err := getBinaryPaths()
 	if nil != err {
 		return nil, err
@@ -195,25 +207,23 @@ func fork() (*os.Process, error) {
 	return p, nil
 }
 
+func shutdownPID(pid int, grace time.Duration) error {
+
+	// TODO: Actually implement a proper grace time / KILL mechanism
+	// defer func() {
+	// 	time.Sleep(grace)
+	// 	syscall.Kill(pid, syscall.SIGKILL)
+	// }()
+
+	return syscall.Kill(pid, syscall.SIGTERM)
+}
+
 func getFDs() []*os.File {
 	return []*os.File{
 		os.Stdin,
 		os.Stdout,
 		os.Stderr,
 	}
-}
-
-func (i *Incept) update(binaryBackupPath string, shutdownFn ...func() error) error {
-
-	// Execute shutdown handlers, if any
-	for _, fn := range shutdownFn {
-		if err := fn(); err != nil {
-			return err
-		}
-	}
-
-	// Indicate to the parent / master process that the child is ready to be replaced
-	return syscall.Kill(os.Getppid(), syscall.SIGUSR2)
 }
 
 func verifyChecksum(data []byte, expectedChecksum []byte) error {
